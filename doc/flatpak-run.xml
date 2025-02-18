@@ -42,7 +42,12 @@
 
         <para>
             If <arg choice="plain">REF</arg> names an installed application,
-            Flatpak runs the application in a sandboxed environment. Extra
+            Flatpak runs the application in a sandboxed environment. You will
+            be prompted with choices if <arg choice="plain">REF</arg> doesn't
+            match any ref exactly but is similar to other refs (e.g. "devhelp"
+            is similar to "org.gnome.Devhelp"), but this fuzzy matching behaviour
+            is disabled if <arg choice="plain">REF</arg> contains slashes or
+            periods. If there's only one match, it will choose it automatically. Extra
             arguments are passed on to the application. The current branch and arch of
             the application is used unless otherwise specified with <option>--branch</option>
             or <option>--arch</option>. See

@@ -97,9 +97,8 @@ flatpak_builtin_run (int argc, char **argv, GCancellable *cancellable, GError **
 {
   g_auto(GStrv) run_environ = NULL;
   g_autoptr(GOptionContext) context = NULL;
-  g_autoptr(FlatpakDeploy) app_deploy = NULL;
-  g_autoptr(FlatpakDecomposed) app_ref = NULL;
-  g_autoptr(FlatpakDecomposed) runtime_ref = NULL;
+  g_autoptr(FlatpakDeploy) deploy = NULL;
+  g_autoptr(FlatpakDecomposed) ref = NULL;
   const char *pref;
   int i;
   int rest_argv_start = 0, rest_argc = 0;
@@ -111,6 +110,7 @@ flatpak_builtin_run (int argc, char **argv, GCancellable *cancellable, GError **
   g_autoptr(GError) local_error = NULL;
   g_autoptr(GPtrArray) dirs = NULL;
   FlatpakRunFlags flags = 0;
+  FindMatchingRefsFlags matching_refs_flags;
 
   run_environ = g_get_environ ();
 
@@ -161,10 +161,27 @@ flatpak_builtin_run (int argc, char **argv, GCancellable *cancellable, GError **
   g_assert (rest_argv_start > 0);
   pref = argv[rest_argv_start];
 
-  if (!flatpak_split_partial_ref_arg (pref, FLATPAK_KINDS_APP | FLATPAK_KINDS_RUNTIME,
-                                      opt_arch, opt_branch,
-                                      &kinds, &id, &arch, &branch, error))
-    return FALSE;
+  if (!flatpak_allow_fuzzy_matching (pref))
+    matching_refs_flags = FIND_MATCHING_REFS_FLAGS_NONE;
+  else
+    matching_refs_flags = FIND_MATCHING_REFS_FLAGS_FUZZY;
+
+  if (matching_refs_flags & FIND_MATCHING_REFS_FLAGS_FUZZY)
+    {
+      flatpak_split_partial_ref_arg_novalidate (pref, FLATPAK_KINDS_APP | FLATPAK_KINDS_RUNTIME,
+                                                opt_arch, opt_branch,
+                                                &kinds, &id, &arch, &branch);
+      /* We used _novalidate so that the app id can be partial, but we can still validate the branch */
+      if (branch != NULL && !flatpak_is_valid_branch (branch, -1, &local_error))
+        return flatpak_fail_error (error, FLATPAK_ERROR_INVALID_REF,
+                                   _("Invalid branch: %s: %s"), branch, local_error->message);
+    }
+  else if (!flatpak_split_partial_ref_arg (pref, FLATPAK_KINDS_APP | FLATPAK_KINDS_RUNTIME,
+                                           opt_arch, opt_branch,
+                                           &kinds, &id, &arch, &branch, error))
+    {
+      return FALSE;
+    }
 
   if (branch == NULL || arch == NULL)
     {
@@ -178,13 +195,13 @@ flatpak_builtin_run (int argc, char **argv, GCancellable *cancellable, GError **
         }
     }
 
-  if ((kinds & FLATPAK_KINDS_APP) != 0)
+  if ((kinds & FLATPAK_KINDS_APP) != 0 && !(matching_refs_flags & FIND_MATCHING_REFS_FLAGS_FUZZY))
     {
-      app_ref = flatpak_decomposed_new_from_parts (FLATPAK_KINDS_APP, id, arch, branch, &local_error);
-      if (app_ref != NULL)
-        app_deploy = flatpak_find_deploy_for_ref_in (dirs, flatpak_decomposed_get_ref (app_ref), opt_commit, cancellable, &local_error);
+      ref = flatpak_decomposed_new_from_parts (FLATPAK_KINDS_APP, id, arch, branch, &local_error);
+      if (ref != NULL)
+        deploy = flatpak_find_deploy_for_ref_in (dirs, flatpak_decomposed_get_ref (ref), opt_commit, cancellable, &local_error);
 
-      if (app_deploy == NULL &&
+      if (deploy == NULL &&
           (!g_error_matches (local_error, FLATPAK_ERROR, FLATPAK_ERROR_NOT_INSTALLED) ||
            (kinds & FLATPAK_KINDS_RUNTIME) == 0))
         {
@@ -196,21 +213,27 @@ flatpak_builtin_run (int argc, char **argv, GCancellable *cancellable, GError **
          is more likely interesting. */
     }
 
-  if (app_deploy == NULL)
+  if (deploy == NULL)
     {
-      g_autoptr(FlatpakDeploy) runtime_deploy = NULL;
       g_autoptr(GError) local_error2 = NULL;
       g_autoptr(GPtrArray) ref_dir_pairs = NULL;
       RefDirPair *chosen_pair = NULL;
-      const char *runtime_arch = arch;
+      const char *chosen_arch = arch;
+
+      /* Allow fuzzy matching only for apps */
+      if (matching_refs_flags & FIND_MATCHING_REFS_FLAGS_FUZZY)
+        kinds = FLATPAK_KINDS_APP;
+      else
+        kinds = FLATPAK_KINDS_RUNTIME;
 
       /* If arch is not specified, only run the default arch to avoid asking for prompts for non-primary arches,
          still asks for prompts if there are multiple branches though */
-      if (runtime_arch == NULL)
-        runtime_arch = flatpak_get_arch ();
+      if (chosen_arch == NULL)
+        chosen_arch = flatpak_get_arch ();
 
       /* Whereas for apps we want to default to using the "current" one (see
        * flatpak-make-current(1)) runtimes don't have a concept of currentness.
+       * Additionally, for fuzzy matched apps we don't know which one the user wants.
        * So prompt if there's ambiguity about which branch to use */
       ref_dir_pairs = g_ptr_array_new_with_free_func ((GDestroyNotify) ref_dir_pair_free);
       for (i = 0; i < dirs->len; i++)
@@ -218,8 +241,8 @@ flatpak_builtin_run (int argc, char **argv, GCancellable *cancellable, GError **
           FlatpakDir *dir = g_ptr_array_index (dirs, i);
           g_autoptr(GPtrArray) refs = NULL;
 
-          refs = flatpak_dir_find_installed_refs (dir, id, branch, runtime_arch, FLATPAK_KINDS_RUNTIME,
-                                                  FIND_MATCHING_REFS_FLAGS_NONE, error);
+          refs = flatpak_dir_find_installed_refs (dir, id, branch, chosen_arch, kinds,
+                                                  matching_refs_flags, error);
           if (refs == NULL)
             return FALSE;
           else if (refs->len == 0)
@@ -227,8 +250,8 @@ flatpak_builtin_run (int argc, char **argv, GCancellable *cancellable, GError **
 
           for (int j = 0; j < refs->len; j++)
             {
-              FlatpakDecomposed *ref = g_ptr_array_index (refs, j);
-              RefDirPair *pair = ref_dir_pair_new (ref, dir);
+              FlatpakDecomposed *found_ref = g_ptr_array_index (refs, j);
+              RefDirPair *pair = ref_dir_pair_new (found_ref, dir);
               g_ptr_array_add (ref_dir_pairs, pair);
             }
         }
@@ -251,28 +274,33 @@ flatpak_builtin_run (int argc, char **argv, GCancellable *cancellable, GError **
            * something that's not deployed */
           chosen_dir_array = g_ptr_array_new ();
           g_ptr_array_add (chosen_dir_array, chosen_pair->dir);
-          runtime_deploy = flatpak_find_deploy_for_ref_in (chosen_dir_array, flatpak_decomposed_get_ref (chosen_pair->ref),
-                                                           opt_commit ? opt_commit : opt_runtime_commit,
-                                                           cancellable, &local_error2);
+          deploy = flatpak_find_deploy_for_ref_in (chosen_dir_array, flatpak_decomposed_get_ref (chosen_pair->ref),
+                                                   opt_commit ? opt_commit : opt_runtime_commit,
+                                                   cancellable, &local_error2);
         }
 
-      if (runtime_deploy == NULL)
+      if (deploy == NULL)
         {
           /* Report old app-kind error, as its more likely right */
           if (local_error != NULL)
             g_propagate_error (error, g_steal_pointer (&local_error));
           else if (local_error2 != NULL)
             g_propagate_error (error, g_steal_pointer (&local_error2));
+          else if (kinds & FLATPAK_KINDS_APP)
+            return flatpak_fail (error, _("No local refs found for '%s'"), id);
           else
             flatpak_fail_error (error, FLATPAK_ERROR_NOT_INSTALLED,
                                 _("runtime/%s/%s/%s not installed"),
                                 id ?: "*unspecified*",
                                 arch ?: "*unspecified*",
                                 branch ?: "*unspecified*");
+
           return FALSE;
         }
 
-      runtime_ref = flatpak_decomposed_ref (chosen_pair->ref);
+      if (ref != NULL)
+        flatpak_decomposed_unref (ref);
+      ref = flatpak_decomposed_ref (chosen_pair->ref);
 
       /* Clear app-kind error */
       g_clear_error (&local_error);
@@ -309,8 +337,8 @@ flatpak_builtin_run (int argc, char **argv, GCancellable *cancellable, GError **
   if (!opt_session_bus)
     flags |= FLATPAK_RUN_FLAG_NO_SESSION_BUS_PROXY;
 
-  if (!flatpak_run_app (app_deploy ? app_ref : runtime_ref,
-                        app_deploy,
+  if (!flatpak_run_app (ref,
+                        kinds & FLATPAK_KINDS_APP ? deploy : NULL,
                         opt_app_path,
                         arg_context,
                         opt_runtime,
